@@ -60,6 +60,9 @@ module tb_snax_llm_layer_smoke;
     localparam logic [11:0] A_RING_BASE = 12'd41;
     localparam logic [11:0] A_Q_BASE    = 12'd42;
     localparam logic [11:0] A_OUT_BASE  = 12'd43;
+    localparam logic [11:0] A_RD_BASE   = 12'd27;
+    localparam logic [11:0] A_RD_NV     = 12'd28;
+    localparam logic [11:0] A_RD_LS     = 12'd29;
     localparam logic [11:0] A_START     = 12'd47;
     localparam logic [11:0] A_RO_SEQ    = 12'd48;
     localparam logic [11:0] A_RO_ID     = 12'd55;
@@ -205,6 +208,48 @@ module tb_snax_llm_layer_smoke;
         return s ? -v : v;
     endfunction
 
+    // Round-to-nearest real -> IEEE FP16 (good enough for kernel self-tests).
+    function automatic logic [15:0] real_to_fp16(input real v);
+        logic        s; real a; int expn; logic [4:0] e; logic [9:0] mant;
+        if (v == 0.0) return 16'h0000;
+        s = (v < 0.0); a = s ? -v : v;
+        expn = 0;
+        while (a >= 2.0) begin a = a / 2.0; expn = expn + 1; end
+        while (a <  1.0) begin a = a * 2.0; expn = expn - 1; end
+        if (expn + 15 <= 0)  return {s, 5'd0, 10'd0};
+        if (expn + 15 >= 31) return {s, 5'b11111, 10'd0};
+        e = expn + 15;
+        mant = $rtoi((a - 1.0) * 1024.0 + 0.5);
+        if (mant >= 1024) begin mant = 10'd0; e = e + 5'd1; end
+        return {s, e, mant};
+    endfunction
+
+    function automatic bit near(input real a, input real b, input real tol);
+        real d;
+        d = a - b; if (d < 0.0) d = -d;
+        return (d <= tol);
+    endfunction
+
+    // --- FP4 log-scale quantizer helpers (mirror slq_encoder / log_quantizer) ---
+    function automatic logic [7:0] mu_of(input logic [15:0] f);
+        logic [4:0] E; logic [9:0] M;
+        E = f[14:10]; M = f[9:0];
+        if (E == 5'd0)  return 8'd0;
+        if (E == 5'd31) return 8'd247;
+        return {E, M[9:7]};
+    endfunction
+
+    function automatic logic [2:0] fp4_mag_of(input logic [7:0] d);
+        if      (d <= 8'd2)  return 3'b111; // 6.0
+        else if (d <= 8'd6)  return 3'b110; // 4.0
+        else if (d <= 8'd10) return 3'b101; // 3.0
+        else if (d <= 8'd14) return 3'b100; // 2.0
+        else if (d <= 8'd18) return 3'b011; // 1.5
+        else if (d <= 8'd24) return 3'b010; // 1.0
+        else if (d <= 8'd36) return 3'b001; // 0.5
+        else                 return 3'b000;
+    endfunction
+
     task automatic check(input bit cond, input string name);
         if (cond) checks_pass = checks_pass + 1;
         else begin
@@ -322,14 +367,110 @@ module tb_snax_llm_layer_smoke;
     endtask
 
     // =========================================================================
+    // CPU ELEMENTWISE KERNELS  (operate on 4 FP16 packed in one 72b TCDM word)
+    //   These are the "remaining" ops of a LLaMA layer that have no HW block.
+    // =========================================================================
+    task automatic cpu_rmsnorm4(input logic [31:0] a,
+                                input real g0, g1, g2, g3);
+        logic [71:0] w; real x0,x1,x2,x3, inv;
+        begin
+            cpu_mem_read(a, w);
+            x0 = fp16_to_real(w[15:0]);  x1 = fp16_to_real(w[31:16]);
+            x2 = fp16_to_real(w[47:32]); x3 = fp16_to_real(w[63:48]);
+            inv = 1.0 / $sqrt((x0*x0 + x1*x1 + x2*x2 + x3*x3) / 4.0);
+            w = 72'd0;
+            w[15:0]  = real_to_fp16(x0*inv*g0); w[31:16] = real_to_fp16(x1*inv*g1);
+            w[47:32] = real_to_fp16(x2*inv*g2); w[63:48] = real_to_fp16(x3*inv*g3);
+            cpu_mem_write(a, w);
+        end
+    endtask
+
+    task automatic cpu_silu4(input logic [31:0] a);
+        logic [71:0] w; real x0,x1,x2,x3;
+        begin
+            cpu_mem_read(a, w);
+            x0 = fp16_to_real(w[15:0]);  x1 = fp16_to_real(w[31:16]);
+            x2 = fp16_to_real(w[47:32]); x3 = fp16_to_real(w[63:48]);
+            w = 72'd0;
+            w[15:0]  = real_to_fp16(x0/(1.0+$exp(-x0)));
+            w[31:16] = real_to_fp16(x1/(1.0+$exp(-x1)));
+            w[47:32] = real_to_fp16(x2/(1.0+$exp(-x2)));
+            w[63:48] = real_to_fp16(x3/(1.0+$exp(-x3)));
+            cpu_mem_write(a, w);
+        end
+    endtask
+
+    task automatic cpu_residual4(input logic [31:0] a, input logic [31:0] b);
+        logic [71:0] wa, wb, wo;
+        begin
+            cpu_mem_read(a, wa);
+            cpu_mem_read(b, wb);
+            wo = 72'd0;
+            wo[15:0]  = real_to_fp16(fp16_to_real(wa[15:0])  + fp16_to_real(wb[15:0]));
+            wo[31:16] = real_to_fp16(fp16_to_real(wa[31:16]) + fp16_to_real(wb[31:16]));
+            wo[47:32] = real_to_fp16(fp16_to_real(wa[47:32]) + fp16_to_real(wb[47:32]));
+            wo[63:48] = real_to_fp16(fp16_to_real(wa[63:48]) + fp16_to_real(wb[63:48]));
+            cpu_mem_write(a, wo);
+        end
+    endtask
+
+    // CPU FP4 quantizer: read 16 FP16 (4 words: src_word..src_word+3, same bank),
+    // emit one 72b packet {scale[7:0], 16 x 4b code} at dst.  Mirrors the RTL
+    // log_quantizer (slq_encoder.sv): block max on mu, log8 S4.3 scale, E2M1 codes.
+    task automatic cpu_quantize16(input int src_word, input int src_bank,
+                                  input int dst_word, input int dst_bank);
+        logic [71:0] wds [0:3];
+        logic [15:0] f;
+        logic [7:0]  mu [0:15];
+        logic [7:0]  mx, dmn, dd;
+        integer      sc, k, i;
+        logic [3:0]  code;
+        logic [2:0]  mag;
+        logic [71:0] pkt;
+        begin
+            for (k = 0; k < 4; k++)
+                cpu_mem_read(tcdm_addr(src_word + k, src_bank), wds[k]);
+            mx = 8'd0;
+            for (i = 0; i < 16; i++) begin
+                f = wds[i/4][(i % 4)*16 +: 16];
+                mu[i] = mu_of(f);
+                if (mu[i] > mx) mx = mu[i];
+            end
+            if (mx == 8'd0) sc = 0;
+            else begin
+                sc = int'(mx) - 140;
+                if (sc > 127) sc = 127;
+                if (sc < -128) sc = -128;
+            end
+            pkt = 72'd0;
+            for (i = 0; i < 16; i++) begin
+                f  = wds[i/4][(i % 4)*16 +: 16];
+                dd = mx - mu[i];
+                if (mu[i] == 8'd0 || mx == 8'd0) mag = 3'b000;
+                else                              mag = fp4_mag_of(dd);
+                code = (mag == 3'b000) ? 4'b0000 : {f[15], mag};
+                pkt[4*i +: 4] = code;
+            end
+            pkt[71:64] = sc[7:0];
+            cpu_mem_write(tcdm_addr(dst_word, dst_bank), pkt);
+        end
+    endtask
+
+    // =========================================================================
     // Main sequence
     // =========================================================================
     int i, cycle_cnt;
     logic [31:0] rd32;
     logic [71:0] peek;
-    bit seen_done;
+    bit seen_done, seen_busy;
     localparam logic [71:0] POKE_VAL = 72'hCAFE_0000_0000_0000_5A;
     localparam logic [31:0] POKE_ADDR = 32'h0003_E940; // bank20, word500 (unused)
+    // Scratch words for CPU elementwise kernel self-tests (bank21, words 600..603)
+    localparam logic [31:0] K_RMS   = 32'h0004_B150;
+    localparam logic [31:0] K_SILU  = 32'h0004_B350;
+    localparam logic [31:0] K_RES_A = 32'h0004_B550;
+    localparam logic [31:0] K_RES_B = 32'h0004_B750;
+    logic [71:0] kw, rw;
 
     initial begin
         csr_req_valid = 1'b0; csr_req_write = 1'b0; csr_req_addr = '0; csr_req_data = '0;
@@ -372,6 +513,100 @@ module tb_snax_llm_layer_smoke;
         cpu_mem_read(POKE_ADDR, peek);
         check(peek === POKE_VAL, "CPU TCDM read/write (master 1)");
 
+        // 3b. CPU elementwise kernels (the LLaMA ops with no HW block)
+        $display("[3b] CPU elementwise kernel self-tests (RMSNorm/SiLU/residual) ...");
+        // RMSNorm: x=[1,2,3,4], gamma=1 -> [0.3651,0.7303,1.0954,1.4606]
+        kw = 72'd0;
+        kw[15:0] = real_to_fp16(1.0); kw[31:16] = real_to_fp16(2.0);
+        kw[47:32]= real_to_fp16(3.0); kw[63:48] = real_to_fp16(4.0);
+        cpu_mem_write(K_RMS, kw);
+        cpu_rmsnorm4(K_RMS, 1.0, 1.0, 1.0, 1.0);
+        cpu_mem_read(K_RMS, rw);
+        check(near(fp16_to_real(rw[15:0]),  0.3651, 0.01), "RMSNorm lane0");
+        check(near(fp16_to_real(rw[31:16]), 0.7303, 0.01), "RMSNorm lane1");
+        check(near(fp16_to_real(rw[47:32]), 1.0954, 0.01), "RMSNorm lane2");
+        check(near(fp16_to_real(rw[63:48]), 1.4606, 0.01), "RMSNorm lane3");
+        // SiLU: x=[-2,-1,1,2] -> [-0.2384,-0.2689,0.7311,1.7616]
+        kw = 72'd0;
+        kw[15:0] = real_to_fp16(-2.0); kw[31:16] = real_to_fp16(-1.0);
+        kw[47:32]= real_to_fp16(1.0);  kw[63:48] = real_to_fp16(2.0);
+        cpu_mem_write(K_SILU, kw);
+        cpu_silu4(K_SILU);
+        cpu_mem_read(K_SILU, rw);
+        check(near(fp16_to_real(rw[15:0]),  -0.2384, 0.02), "SiLU lane0");
+        check(near(fp16_to_real(rw[31:16]), -0.2689, 0.02), "SiLU lane1");
+        check(near(fp16_to_real(rw[47:32]),  0.7311, 0.02), "SiLU lane2");
+        check(near(fp16_to_real(rw[63:48]),  1.7616, 0.02), "SiLU lane3");
+        // Residual: [1,2,3,4] + [0.5,0.5,0.5,0.5] -> [1.5,2.5,3.5,4.5]
+        kw = 72'd0;
+        kw[15:0]=real_to_fp16(1.0); kw[31:16]=real_to_fp16(2.0);
+        kw[47:32]=real_to_fp16(3.0); kw[63:48]=real_to_fp16(4.0);
+        cpu_mem_write(K_RES_A, kw);
+        kw = 72'd0;
+        kw[15:0]=real_to_fp16(0.5); kw[31:16]=real_to_fp16(0.5);
+        kw[47:32]=real_to_fp16(0.5); kw[63:48]=real_to_fp16(0.5);
+        cpu_mem_write(K_RES_B, kw);
+        cpu_residual4(K_RES_A, K_RES_B);
+        cpu_mem_read(K_RES_A, rw);
+        check(near(fp16_to_real(rw[15:0]),  1.5, 0.01), "residual lane0");
+        check(near(fp16_to_real(rw[31:16]), 2.5, 0.01), "residual lane1");
+        check(near(fp16_to_real(rw[47:32]), 3.5, 0.01), "residual lane2");
+        check(near(fp16_to_real(rw[63:48]), 4.5, 0.01), "residual lane3");
+
+        // 3c. CPU FP4 quantizer: FP16 block -> 72b packet (bit-exact vs RTL model)
+        $display("[3c] CPU FP4 quantizer (FP16 block -> packet) ...");
+        kw = 72'd0; kw[15:0]=real_to_fp16(1.0);  kw[31:16]=real_to_fp16(-1.0);
+        kw[47:32]=real_to_fp16(2.0);  kw[63:48]=real_to_fp16(-2.0);
+        cpu_mem_write(tcdm_addr(700,22), kw);
+        kw = 72'd0; kw[15:0]=real_to_fp16(3.0);  kw[31:16]=real_to_fp16(-3.0);
+        kw[47:32]=real_to_fp16(0.5);  kw[63:48]=real_to_fp16(-0.5);
+        cpu_mem_write(tcdm_addr(701,22), kw);
+        kw = 72'd0; kw[15:0]=real_to_fp16(4.0);  kw[31:16]=real_to_fp16(-4.0);
+        kw[47:32]=real_to_fp16(6.0);  kw[63:48]=real_to_fp16(-6.0);
+        cpu_mem_write(tcdm_addr(702,22), kw);
+        kw = 72'd0; kw[15:0]=real_to_fp16(0.25); kw[31:16]=real_to_fp16(-0.25);
+        kw[47:32]=real_to_fp16(1.5);  kw[63:48]=real_to_fp16(-1.5);
+        cpu_mem_write(tcdm_addr(703,22), kw);
+        cpu_quantize16(700, 22, 704, 22);
+        cpu_mem_read(tcdm_addr(704,22), rw);
+        check(rw === 72'h00B391F7E691D5C4A2, "CPU FP4 quantizer (packet bit-exact)");
+
+        // 3d. HW readback-requant job: exercises the REAL RTL log_quantizer.
+        //     read streamer (master20) reads FP16 -> log_quantizer -> write-out
+        //     FP4 (master19) writes the 72b packet.  Compare to the CPU golden.
+        $display("[3d] HW readback-requant job (RTL log_quantizer) ...");
+        kw = 72'd0; kw[15:0]=real_to_fp16(1.0);  kw[31:16]=real_to_fp16(-1.0);
+        kw[47:32]=real_to_fp16(2.0);  kw[63:48]=real_to_fp16(-2.0);
+        cpu_mem_write(tcdm_addr(800,23), kw);
+        kw = 72'd0; kw[15:0]=real_to_fp16(3.0);  kw[31:16]=real_to_fp16(-3.0);
+        kw[47:32]=real_to_fp16(0.5);  kw[63:48]=real_to_fp16(-0.5);
+        cpu_mem_write(tcdm_addr(801,23), kw);
+        kw = 72'd0; kw[15:0]=real_to_fp16(4.0);  kw[31:16]=real_to_fp16(-4.0);
+        kw[47:32]=real_to_fp16(6.0);  kw[63:48]=real_to_fp16(-6.0);
+        cpu_mem_write(tcdm_addr(802,23), kw);
+        kw = 72'd0; kw[15:0]=real_to_fp16(0.25); kw[31:16]=real_to_fp16(-0.25);
+        kw[47:32]=real_to_fp16(1.5);  kw[63:48]=real_to_fp16(-1.5);
+        cpu_mem_write(tcdm_addr(803,23), kw);
+
+        cpu_csr_write(A_CTRL,    32'h0);
+        cpu_csr_write(A_SEQ_CTRL,32'h3);                  // op_mode=11 (readback), no DMA
+        cpu_csr_write(A_RD_BASE, tcdm_addr(800,23));      // FP16 source (4 words)
+        cpu_csr_write(A_RD_NV,   32'd1);                  // 1 vector = 16 FP16
+        cpu_csr_write(A_RD_LS,   32'h200);                // word stride
+        cpu_csr_write(A_WO_BASE, tcdm_addr(810,23));      // packet destination
+        cpu_csr_write(A_START,   32'h0000_0003);
+
+        seen_done = 1'b0; seen_busy = 1'b0; cycle_cnt = 0;
+        while (!seen_done && cycle_cnt < 20000) begin
+            @(posedge clk);
+            cycle_cnt = cycle_cnt + 1;
+            if (busy) seen_busy = 1'b1;
+            if (seen_busy && done_irq && !busy) seen_done = 1'b1;
+        end
+        check(seen_done, "readback-requant job finished");
+        cpu_mem_read(tcdm_addr(810,23), rw);
+        check(rw === 72'h00B391F7E691D5C4A2, "HW log_quantizer packet bit-exact");
+
         // 4. CPU programs the sequencer descriptor and launches GEMM
         $display("[4] CPU programs CSR and launches GEMM ...");
         cpu_csr_read(A_RO_ID, rd32);
@@ -391,11 +626,12 @@ module tb_snax_llm_layer_smoke;
         cpu_csr_write(A_START,     32'h0000_0003);
 
         // 5. Wait for completion
-        seen_done = 1'b0; cycle_cnt = 0;
+        seen_done = 1'b0; seen_busy = 1'b0; cycle_cnt = 0;
         while (!seen_done && cycle_cnt < 20000) begin
             @(posedge clk);
             cycle_cnt = cycle_cnt + 1;
-            if (done_irq && !busy) seen_done = 1'b1;
+            if (busy) seen_busy = 1'b1;
+            if (seen_busy && done_irq && !busy) seen_done = 1'b1;
         end
         $display("    Completed in %0d cycles (busy=%0b done_irq=%0b)",
                  cycle_cnt, busy, done_irq);

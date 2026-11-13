@@ -380,6 +380,11 @@ module snax_llm_sequencer #(
     logic         gemm_drain_active_q;
     logic [4:0]   gdr_idx_q;            // 0..15 = slot being issued, 16 = done
 
+    // Sticky latch for the readback-requant one-cycle rd_done pulse: the write
+    // engine may still be busy on the pulse cycle, so latch it and exit RD_RUN
+    // once the write-out has also drained.
+    logic         rd_done_seen_q, rd_done_seen_d;
+
     wire [31:0] gemm_wt_addr = cfg_tcdm_ring_base_i +
                               ((32'(cnt_gn_q) * 32'(cfg_gemm_k_blocks_i) +
                                 32'(cnt_gk_q)) * 32'h200);
@@ -440,6 +445,7 @@ module snax_llm_sequencer #(
     always_comb begin
         state_d                   = state_q;
         gemm_drain_seen_d         = gemm_drain_seen_q;
+        rd_done_seen_d            = rd_done_seen_q;
         dma_req_valid_o           = 1'b0;
         dma_req_dir_o             = 2'd0; // DRAM -> TCDM
         dma_req_dram_addr_o       = cfg_dram_kv_base_i + (32'(cnt_kj_q) * cfg_stride_tile_i);
@@ -552,6 +558,7 @@ module snax_llm_sequencer #(
             // =================================================================
             ST_RD_LAUNCH: begin
                 if (!rd_busy_i && !wo_busy_i) begin
+                    rd_done_seen_d     = 1'b0;
                     cfg_enable_slq_o   = 1'b1;
                     rd_start_o         = 1'b1;
                     wo_start_o         = 1'b1;
@@ -567,7 +574,9 @@ module snax_llm_sequencer #(
 
             ST_RD_RUN: begin
                 cfg_enable_slq_o = 1'b1;
-                if (rd_done_i && !wo_busy_i)
+                // Latch the one-cycle rd_done pulse; exit once write-out drains.
+                rd_done_seen_d = rd_done_seen_q | rd_done_i;
+                if (rd_done_seen_d && !wo_busy_i)
                     state_d = ST_WAIT_WRITE_OUT;
             end
 
@@ -793,9 +802,10 @@ module snax_llm_sequencer #(
             end
 
             ST_DONE: begin
-                // Hold DONE until the next start so `done_o` is observable.
-                if (!start_i)
-                    state_d = ST_DONE;
+                // Hold DONE until the next start so `done_o` is observable, then
+                // accept another job (multi-job layers: norm->QKV->attn->FFN...).
+                if (start_i)
+                    state_d = ST_PREP_DRAIN;
             end
 
             default: state_d = ST_IDLE;
@@ -835,8 +845,10 @@ module snax_llm_sequencer #(
             gemm_drain_seen_q <= 1'b0;
             gemm_drain_active_q <= 1'b0;
             gdr_idx_q           <= 5'd0;
+            rd_done_seen_q      <= 1'b0;
         end else begin
             state_q <= state_d;
+            rd_done_seen_q <= rd_done_seen_d;
 
             if (start_i) begin
                 cnt_h_q           <= '0;
@@ -852,6 +864,7 @@ module snax_llm_sequencer #(
                 gemm_drain_seen_q <= 1'b0;
                 gemm_drain_active_q <= 1'b0;
                 gdr_idx_q           <= 5'd0;
+                rd_done_seen_q      <= 1'b0;
                 kv_first_q        <= 1'b1;
             end else begin
                 // ---------------------------------------------------------

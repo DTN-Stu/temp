@@ -110,9 +110,30 @@ quanh accelerator:
 - Luồng: build DRAM → DMA copy DRAM→TCDM → CPU poke/peek → CPU lập trình CSR →
   chạy GEMM qua sequencer → DMA readback → so bit-exact.
 
-Kết quả: **PASS — 1024/1024 FP16 bit-exact**, GEMM 367 cycle, 3/3 check OK.
+Kết quả: **PASS — 1024/1024 FP16 bit-exact**, GEMM 367 cycle, 18/18 check OK.
 Đây là nền để mở rộng lên **1 layer prefill LLaMA-style** (RMSNorm/RoPE/SwiGLU/
 residual chạy trên CPU model, ghép chuỗi job qua CSR).
+
+### 5.1 Primitives của layer đã có & được kiểm chứng
+
+- **CPU elementwise kernels** (chạy trên FP16 trong TCDM, self-test):
+  `cpu_rmsnorm4`, `cpu_silu4`, `cpu_residual4` — 12 lane check PASS.
+- **CPU FP4 quantizer** `cpu_quantize16` (FP16→packet 72b, mô phỏng đúng
+  `slq_encoder`/`log_quantizer`) — packet bit-exact với golden Python.
+- **HW readback-requant job** (opcode 11): read streamer (master20) → **khối
+  `log_quantizer` HW** → write-out FP4 (master19). Packet đọc lại **bit-exact**
+  `72'h00B391F7E691D5C4A2` → khối lượng tử HW đã được exercise thật.
+
+### 5.2 Sửa RTL để chạy đa job
+
+Khi thêm job requant phát hiện 2 lỗi trong `snax_llm_sequencer.sv`:
+- `ST_DONE` không cho phép khởi động job kế tiếp → sửa để `start_i` quay về
+  `ST_PREP_DRAIN` (bắt buộc cho chuỗi job của một layer).
+- Xung `rd_done` 1 chu kỳ bị lỡ khi write-out còn bận → thêm latch sticky
+  `rd_done_seen` rồi thoát `ST_RD_RUN` khi write-out đã xả.
+
+Regression sau sửa: `clean` / `gemm` / `llama` vẫn bit-exact (gemm 367 cyc,
+llama 6704 cyc).
 
 ---
 
